@@ -132,6 +132,23 @@ def _generate_video_path(session_id: str, model: str) -> Path:
     return _get_videos_dir() / filename
 
 
+def _get_audio_dir() -> Path:
+    """Get the directory for auto-saved audio."""
+    from .sessions import get_data_dir
+    audio_dir = get_data_dir() / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    return audio_dir
+
+
+def _generate_audio_path(session_id: str, model: str, ext: str = "mp3") -> Path:
+    """Generate a unique path for auto-saving audio."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = str(uuid.uuid4())[:8]
+    session_prefix = session_id.split("-")[1] if "-" in session_id else session_id[:4]
+    filename = f"{session_prefix}_{timestamp}_{unique_id}.{ext}"
+    return _get_audio_dir() / filename
+
+
 def _record(mgr, session_id: str, provider: str, model: str, cost: float, allowed: bool,
             reason: str = None, image_path: str = None, request_params: dict = None, response_data: dict = None):
     """Record the request with optional extended data for history view."""
@@ -226,25 +243,56 @@ class Query:
 
 
 # Default prices (can be overridden in settings)
+# Updated January 2026
 DEFAULT_PRICES = {
     "openai": {
+        # Image generation
         "gpt-image-1.5": {"low": 0.02, "medium": 0.07, "high": 0.20},
         "dall-e-3": {"standard": 0.04, "hd": 0.08},
+        # Chat/completion models
+        "gpt-5.2": 0.01,  # Latest
+        "gpt-5.2-mini": 0.002,
+        "gpt-5": 0.008,
+        "gpt-4.5": 0.005,
         "gpt-4o": 0.005,
         "gpt-4o-mini": 0.0002,
+        "o3": 0.015,  # Reasoning model
+        "o3-mini": 0.003,
+        "o1": 0.012,
+        "o1-mini": 0.002,
     },
     "fal": {
         # gpt-image-1.5 via fal is cheaper than OpenAI direct
         "gpt-image-1.5": {"low": 0.013, "medium": 0.051, "high": 0.17},
+        # Flux models
         "flux-dev": 0.025,
         "flux-dev-image-to-image": 0.025,
         "flux-schnell": 0.003,
         "flux-pro": 0.05,
+        "flux-pro-1.1": 0.04,
+        "flux-realism": 0.025,
+        # Other models
         "recraft-v3": 0.04,
+        "ideogram-v2": 0.08,
+        "stable-diffusion-3.5": 0.035,
     },
     "minimax": {
+        # Video
         "video-01": 0.05,
         "video-01-live2d": 0.04,
+        # TTS (per character)
+        "speech-01": 0.0001,  # ~$0.10 per 1000 chars
+        "speech-01-hd": 0.0003,
+        "speech-02": 0.00015,  # Newer model
+    },
+    "anthropic": {
+        "claude-opus-4.5": 0.015,
+        "claude-sonnet-4": 0.003,
+        "claude-haiku-3.5": 0.0008,
+    },
+    "google": {
+        "gemini-2.0-flash": 0.0001,
+        "gemini-2.0-pro": 0.00125,
     }
 }
 
@@ -1027,6 +1075,169 @@ class MiniMax:
                 "url_created": response_timestamp,
                 "task_id": task_id,
                 "file_size_bytes": len(video_bytes),
+            }
+            _record(mgr, session_id, "minimax", model, cost, True,
+                    image_path=str(actual_save_path), request_params=req_params, response_data=resp_data)
+
+            return result
+
+        except requests.exceptions.RequestException as e:
+            _record(mgr, session_id, "minimax", model, 0, False, f"Network error: {str(e)}")
+            raise RuntimeError(f"Network error: {str(e)}")
+
+    @staticmethod
+    def tts(
+        session_id: str,
+        text: str,
+        voice_id: str = "male-qn-qingse",
+        model: str = "speech-01",
+        speed: float = 1.0,
+        pitch: int = 0,
+        save_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Generate speech from text using MiniMax TTS.
+
+        Args:
+            session_id: Your session ID
+            text: Text to convert to speech
+            voice_id: Voice to use (e.g., "male-qn-qingse", "female-shaonv", "presenter_male", etc.)
+            model: TTS model ("speech-01" or "speech-01-hd")
+            speed: Speech speed (0.5 to 2.0, default 1.0)
+            pitch: Pitch adjustment (-12 to 12, default 0)
+            save_to: Optional file path to save audio
+
+        Returns:
+            {"audio_url": "...", "saved_to": "path"}
+        """
+        # Cost based on character count
+        char_count = len(text)
+        cost_per_char = _get_price("minimax", model)
+        cost = cost_per_char * char_count
+
+        req_params = {
+            "text_length": char_count,
+            "voice_id": voice_id,
+            "model": model,
+            "speed": speed,
+            "pitch": pitch,
+        }
+
+        # 1. Check session
+        mgr = _check_session(session_id)
+
+        # 2. Check provider
+        try:
+            _check_provider(mgr, session_id, "minimax")
+        except PermissionError as e:
+            _record(mgr, session_id, "minimax", model, cost, False, str(e), request_params=req_params)
+            raise
+
+        # 3. Check model
+        try:
+            _check_model(mgr, session_id, model)
+        except PermissionError as e:
+            _record(mgr, session_id, "minimax", model, cost, False, f"Model blocked: {model}", request_params=req_params)
+            raise
+
+        # 4. Check rate limit
+        try:
+            _check_rate_limit(mgr, session_id)
+        except PermissionError as e:
+            _record(mgr, session_id, "minimax", model, cost, False, str(e), request_params=req_params)
+            raise
+
+        # 5. Check budget
+        session = mgr.get_session(session_id)
+        if session.budget_limit > 0 and (session.total_cost + cost) > session.budget_limit:
+            remaining = max(0, session.budget_limit - session.total_cost)
+            _record(mgr, session_id, "minimax", model, cost, False, "Would exceed budget", request_params=req_params)
+            raise PermissionError(
+                f"Budget exceeded. Limit: ${session.budget_limit:.2f}, "
+                f"Spent: ${session.total_cost:.2f}, Remaining: ${remaining:.2f}, "
+                f"Request cost: ${cost:.4f} ({char_count} chars)"
+            )
+
+        api_key = _get_key("minimax")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": model,
+            "text": text,
+            "voice_setting": {
+                "voice_id": voice_id,
+                "speed": speed,
+                "pitch": pitch,
+            },
+            "audio_setting": {
+                "sample_rate": 32000,
+                "bitrate": 128000,
+                "format": "mp3",
+            }
+        }
+
+        response_timestamp = datetime.now().isoformat()
+
+        try:
+            response = requests.post(
+                f"{MiniMax.BASE_URL}/t2a_v2",
+                headers=headers,
+                json=payload,
+                timeout=120
+            )
+
+            if response.status_code != 200:
+                error_msg = response.text[:200]
+                _record(mgr, session_id, "minimax", model, 0, False, f"API error: {response.status_code}")
+                raise RuntimeError(f"MiniMax TTS error {response.status_code}: {error_msg}")
+
+            data = response.json()
+
+            if data.get("base_resp", {}).get("status_code") != 0:
+                error_msg = data.get("base_resp", {}).get("status_msg", "Unknown error")
+                _record(mgr, session_id, "minimax", model, 0, False, f"API rejected: {error_msg}")
+                raise RuntimeError(f"MiniMax TTS rejected: {error_msg}")
+
+            # Get audio data (base64 encoded)
+            audio_data = data.get("data", {}).get("audio")
+            if not audio_data:
+                # Try alternate response format
+                audio_url = data.get("audio_file")
+                if audio_url:
+                    audio_response = requests.get(audio_url, timeout=60)
+                    audio_bytes = audio_response.content
+                else:
+                    _record(mgr, session_id, "minimax", model, 0, False, "No audio in response")
+                    raise RuntimeError("MiniMax TTS did not return audio data")
+            else:
+                # Decode base64 audio
+                audio_bytes = base64.b64decode(audio_data)
+
+            # Save audio
+            if save_to:
+                actual_save_path = Path(save_to).resolve()
+            else:
+                actual_save_path = _generate_audio_path(session_id, model, "mp3")
+
+            actual_save_path.parent.mkdir(parents=True, exist_ok=True)
+            actual_save_path.write_bytes(audio_bytes)
+
+            result = {
+                "saved_to": str(actual_save_path),
+                "char_count": char_count,
+                "cost": cost,
+            }
+
+            resp_data = {
+                "has_audio": True,
+                "audio_path": str(actual_save_path),
+                "char_count": char_count,
+                "url_created": response_timestamp,
+                "file_size_bytes": len(audio_bytes),
             }
             _record(mgr, session_id, "minimax", model, cost, True,
                     image_path=str(actual_save_path), request_params=req_params, response_data=resp_data)
