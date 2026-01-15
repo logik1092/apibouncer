@@ -277,13 +277,26 @@ DEFAULT_PRICES = {
         "stable-diffusion-3.5": 0.035,
     },
     "minimax": {
-        # Video
-        "video-01": 0.05,
-        "video-01-live2d": 0.04,
-        # TTS (per character)
-        "speech-01": 0.0001,  # ~$0.10 per 1000 chars
-        "speech-01-hd": 0.0003,
-        "speech-02": 0.00015,  # Newer model
+        # Video (per video, not per second)
+        "MiniMax-Hailuo-2.3-Fast-768p-6s": 0.19,
+        "MiniMax-Hailuo-2.3-Fast-768p-10s": 0.32,
+        "MiniMax-Hailuo-2.3-Fast-1080p-6s": 0.33,
+        "MiniMax-Hailuo-2.3-768p-6s": 0.28,
+        "MiniMax-Hailuo-2.3-768p-10s": 0.56,
+        "MiniMax-Hailuo-2.3-1080p-6s": 0.49,
+        "MiniMax-Hailuo-02-512p-6s": 0.10,
+        "MiniMax-Hailuo-02-512p-10s": 0.15,
+        "video-01": 0.28,  # Default/legacy
+        # TTS (per character) - $60/M = $0.00006/char, $100/M = $0.0001/char
+        "speech-02-turbo": 0.00006,
+        "speech-2.6-turbo": 0.00006,
+        "speech-02-hd": 0.0001,
+        "speech-2.6-hd": 0.0001,
+        "speech-01": 0.00006,  # Legacy
+        # Music
+        "music-2.0": 0.03,  # Per song (up to 5 min)
+        # Image
+        "image-01": 0.0035,
     },
     "anthropic": {
         "claude-opus-4.5": 0.015,
@@ -1090,7 +1103,7 @@ class MiniMax:
         session_id: str,
         text: str,
         voice_id: str = "male-qn-qingse",
-        model: str = "speech-01",
+        model: str = "speech-02-turbo",
         speed: float = 1.0,
         pitch: int = 0,
         save_to: Optional[str] = None,
@@ -1102,13 +1115,17 @@ class MiniMax:
             session_id: Your session ID
             text: Text to convert to speech
             voice_id: Voice to use (e.g., "male-qn-qingse", "female-shaonv", "presenter_male", etc.)
-            model: TTS model ("speech-01" or "speech-01-hd")
+            model: TTS model ("speech-02-turbo", "speech-02-hd", "speech-2.6-turbo", "speech-2.6-hd")
             speed: Speech speed (0.5 to 2.0, default 1.0)
             pitch: Pitch adjustment (-12 to 12, default 0)
             save_to: Optional file path to save audio
 
         Returns:
-            {"audio_url": "...", "saved_to": "path"}
+            {"saved_to": "path", "char_count": N, "cost": X}
+
+        Pricing:
+            speech-02-turbo / speech-2.6-turbo: $0.06 per 1000 chars
+            speech-02-hd / speech-2.6-hd: $0.10 per 1000 chars
         """
         # Cost based on character count
         char_count = len(text)
