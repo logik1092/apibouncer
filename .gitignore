@@ -49,6 +49,9 @@ Thumbs.db
 *.mp4
 *.webm
 
+# But allow screenshots for README
+!screenshots/*.png
+
 # Logs
 *.log
 

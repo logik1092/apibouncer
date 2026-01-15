@@ -39,9 +39,19 @@ except ImportError:
 try:
     import keyring
 except ImportError:
+    keyring = None
+
+# Secure encrypted keystore (preferred over keyring)
+try:
+    from apibouncer.keystore import get_keystore
+    HAS_KEYSTORE = True
+except ImportError:
+    HAS_KEYSTORE = False
+
+if not HAS_KEYSTORE and not keyring:
     root = tk.Tk()
     root.withdraw()
-    messagebox.showerror("Missing Dependency", "Run: pip install keyring")
+    messagebox.showerror("Missing Dependency", "Run: pip install cryptography")
     sys.exit(1)
 
 # Windows: Set unique AppUserModelID so taskbar shows our icon, not Python's
@@ -109,6 +119,50 @@ except ImportError:
 SERVICE_NAME = "apibouncer"
 
 
+# =============================================================================
+# Secure Key Management (encrypted keystore with keyring fallback)
+# =============================================================================
+
+def secure_get_key(provider: str) -> str:
+    """Get API key from secure storage."""
+    key = None
+    if HAS_KEYSTORE:
+        try:
+            key = get_keystore().get_key(provider)
+        except Exception:
+            pass
+    if not key and keyring:
+        key = keyring.get_password(SERVICE_NAME, provider)
+    return key
+
+
+def secure_set_key(provider: str, api_key: str):
+    """Store API key in secure encrypted storage."""
+    if HAS_KEYSTORE:
+        get_keystore().set_key(provider, api_key)
+    elif keyring:
+        keyring.set_password(SERVICE_NAME, provider, api_key)
+
+
+def secure_delete_key(provider: str):
+    """Delete API key from secure storage."""
+    if HAS_KEYSTORE:
+        try:
+            get_keystore().delete_key(provider)
+        except Exception:
+            pass
+    if keyring:
+        try:
+            keyring.delete_password(SERVICE_NAME, provider)
+        except Exception:
+            pass
+
+
+def secure_has_key(provider: str) -> bool:
+    """Check if API key exists in secure storage."""
+    return secure_get_key(provider) is not None
+
+
 def mask_session_id(session_id: str) -> str:
     """Mask session ID for display. Shows APBN-XXXX-**** format.
 
@@ -124,8 +178,9 @@ def mask_session_id(session_id: str) -> str:
 
 
 # Version history
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 VERSION_HISTORY = [
+    ("1.7.0", "2026-01-15", "Barrier Mode: queue-based approval window, per-session override"),
     ("1.6.1", "2026-01-14", "Enhanced monitor: settings panel, thumbnails, prompt preview"),
     ("1.6.0", "2026-01-14", "Real-time session monitor, rate limiting, MiniMax video"),
     ("1.5.2", "2026-01-14", "PANIC: instant enable, confirm disable, red UI overlay"),
@@ -285,6 +340,11 @@ class ModernApp:
         self.enable_notifications = self.session_mgr.settings.get("enable_notifications", False)
         self.tray_icon = None
 
+        # Barrier mode window
+        self.barrier_window = None
+        self.barrier_indicator = None
+        self.session_mgr.set_barrier_callback(self.on_barrier_request)
+
         self.create_ui()
         self.show_tab("dashboard")
 
@@ -418,6 +478,281 @@ class ModernApp:
         except Exception:
             pass  # Notifications are optional, don't crash
 
+    # =========================================================================
+    # Barrier Mode - Request Approval Window
+    # =========================================================================
+
+    def on_barrier_request(self):
+        """Callback when new barrier requests arrive. Called from worker threads."""
+        # Schedule UI update on main thread
+        try:
+            self.root.after(0, self._handle_barrier_request)
+        except Exception:
+            pass
+
+    def _handle_barrier_request(self):
+        """Handle new barrier request on main thread."""
+        self.update_barrier_indicator()
+        # Auto-open barrier window if requests are pending
+        pending = self.session_mgr.get_pending_requests()
+        if pending and not self.barrier_window:
+            self.show_barrier_window()
+        elif pending and self.barrier_window:
+            self.refresh_barrier_list()
+
+    def update_barrier_indicator(self):
+        """Update the barrier indicator in sidebar."""
+        if not self.barrier_indicator:
+            return
+
+        try:
+            # Read fresh from disk for cross-process consistency
+            barrier_active = self.session_mgr.is_barrier_active()
+            pending = len(self.session_mgr.get_pending_requests())
+
+            if barrier_active:
+                if pending > 0:
+                    self.barrier_indicator.configure(
+                        text=f"🛡️ Barrier: {pending} pending",
+                        fg="#ff6600", bg="#3d2000"
+                    )
+                else:
+                    self.barrier_indicator.configure(
+                        text="🛡️ Barrier: Active",
+                        fg="#00ff88", bg=COLORS["card"]
+                    )
+            else:
+                self.barrier_indicator.configure(
+                    text="🛡️ Barrier: Off",
+                    fg=COLORS["text_muted"], bg=COLORS["card"]
+                )
+        except Exception:
+            pass
+
+    def show_barrier_window(self):
+        """Show the barrier approval window."""
+        if self.barrier_window:
+            self.barrier_window.lift()
+            self.barrier_window.focus_force()
+            self.refresh_barrier_list()
+            return
+
+        self.barrier_window = tk.Toplevel(self.root)
+        self.barrier_window.title("🛡️ Barrier Mode - Pending Requests")
+        self.barrier_window.geometry("700x500")
+        self.barrier_window.configure(bg=COLORS["bg"])
+        self.barrier_window.transient(self.root)
+
+        # Keep on top
+        self.barrier_window.attributes('-topmost', True)
+
+        # Handle close
+        def on_close():
+            self.barrier_window.destroy()
+            self.barrier_window = None
+        self.barrier_window.protocol("WM_DELETE_WINDOW", on_close)
+
+        # Header
+        header = tk.Frame(self.barrier_window, bg=COLORS["card"], pady=15, padx=20)
+        header.pack(fill="x")
+
+        tk.Label(header, text="🛡️ Pending API Requests",
+                font=("Arial", 14, "bold"),
+                fg=COLORS["text"], bg=COLORS["card"]).pack(side="left")
+
+        # Bulk action buttons
+        btn_frame = tk.Frame(header, bg=COLORS["card"])
+        btn_frame.pack(side="right")
+
+        approve_all_btn = tk.Label(btn_frame, text="✓ Approve All",
+                                  font=("Arial", 10, "bold"),
+                                  fg="#000000", bg="#00ff88",
+                                  padx=12, pady=6, cursor="hand2")
+        approve_all_btn.pack(side="left", padx=5)
+        approve_all_btn.bind("<Button-1>", lambda e: self.approve_all_barrier())
+
+        deny_all_btn = tk.Label(btn_frame, text="✗ Deny All",
+                               font=("Arial", 10, "bold"),
+                               fg="#ffffff", bg="#ff4444",
+                               padx=12, pady=6, cursor="hand2")
+        deny_all_btn.pack(side="left", padx=5)
+        deny_all_btn.bind("<Button-1>", lambda e: self.deny_all_barrier())
+
+        turn_off_btn = tk.Label(btn_frame, text="⏻ Turn Off",
+                               font=("Arial", 10, "bold"),
+                               fg="#ffffff", bg="#666666",
+                               padx=12, pady=6, cursor="hand2")
+        turn_off_btn.pack(side="left", padx=5)
+        turn_off_btn.bind("<Button-1>", lambda e: self.turn_off_barrier_mode())
+
+        # Status
+        self.barrier_status = tk.Label(header, text="",
+                                       font=("Arial", 9),
+                                       fg=COLORS["text_muted"], bg=COLORS["card"])
+        self.barrier_status.pack(side="right", padx=20)
+
+        # Request list container with scrollbar
+        list_container = tk.Frame(self.barrier_window, bg=COLORS["bg"])
+        list_container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        canvas = tk.Canvas(list_container, bg=COLORS["bg"], highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        self.barrier_list_frame = tk.Frame(canvas, bg=COLORS["bg"])
+
+        self.barrier_list_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=self.barrier_list_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Store canvas reference for refresh
+        self.barrier_canvas = canvas
+
+        # Populate list
+        self.refresh_barrier_list()
+
+        # Auto-refresh every 2 seconds (500ms was too fast, caused flickering)
+        self._barrier_refresh_job = None
+        def auto_refresh():
+            if self.barrier_window:
+                self.refresh_barrier_list()
+                self._barrier_refresh_job = self.barrier_window.after(2000, auto_refresh)
+        auto_refresh()
+
+    def refresh_barrier_list(self):
+        """Refresh the list of pending requests (only if changed)."""
+        if not self.barrier_window or not self.barrier_list_frame:
+            return
+
+        pending = self.session_mgr.get_pending_requests()
+        pending_ids = [r.id for r in pending]
+
+        # Check if anything changed - skip rebuild if same
+        if hasattr(self, '_last_pending_ids') and self._last_pending_ids == pending_ids:
+            return  # No change, skip refresh to prevent flickering
+
+        self._last_pending_ids = pending_ids
+
+        # Clear existing items
+        for widget in self.barrier_list_frame.winfo_children():
+            widget.destroy()
+
+        if not pending:
+            tk.Label(self.barrier_list_frame,
+                    text="No pending requests",
+                    font=("Arial", 12),
+                    fg=COLORS["text_muted"], bg=COLORS["bg"]).pack(pady=50)
+            if hasattr(self, 'barrier_status') and self.barrier_status:
+                self.barrier_status.configure(text="Waiting for requests...")
+            return
+
+        if hasattr(self, 'barrier_status') and self.barrier_status:
+            self.barrier_status.configure(text=f"{len(pending)} request(s) awaiting approval")
+
+        for req in pending:
+            self._create_request_card(req)
+
+        self.update_barrier_indicator()
+
+    def _create_request_card(self, req):
+        """Create a card for a single pending request."""
+        card = tk.Frame(self.barrier_list_frame, bg=COLORS["card"], pady=10, padx=15)
+        card.pack(fill="x", pady=5, padx=5)
+
+        # Top row: Session, Provider, Model, Cost
+        top_row = tk.Frame(card, bg=COLORS["card"])
+        top_row.pack(fill="x")
+
+        tk.Label(top_row, text=f"[{req.session_name}]",
+                font=("Arial", 10, "bold"),
+                fg="#00aaff", bg=COLORS["card"]).pack(side="left")
+
+        tk.Label(top_row, text=f"  {req.provider}",
+                font=("Arial", 10),
+                fg="#ff00ff", bg=COLORS["card"]).pack(side="left")
+
+        tk.Label(top_row, text=f" → {req.model}",
+                font=("Arial", 10),
+                fg=COLORS["text"], bg=COLORS["card"]).pack(side="left")
+
+        tk.Label(top_row, text=f"${req.estimated_cost:.4f}",
+                font=("Arial", 10, "bold"),
+                fg="#ffaa00", bg=COLORS["card"]).pack(side="right")
+
+        tk.Label(top_row, text=req.timestamp,
+                font=("Arial", 9),
+                fg=COLORS["text_muted"], bg=COLORS["card"]).pack(side="right", padx=10)
+
+        # Prompt preview (if any)
+        if req.prompt_preview:
+            prompt_frame = tk.Frame(card, bg="#1a1a2e", padx=8, pady=5)
+            prompt_frame.pack(fill="x", pady=(8, 0))
+
+            tk.Label(prompt_frame, text=req.prompt_preview,
+                    font=("Arial", 9),
+                    fg=COLORS["text_secondary"], bg="#1a1a2e",
+                    wraplength=600, justify="left").pack(anchor="w")
+
+        # Action buttons
+        btn_row = tk.Frame(card, bg=COLORS["card"])
+        btn_row.pack(fill="x", pady=(10, 0))
+
+        approve_btn = tk.Label(btn_row, text="✓ Approve",
+                              font=("Arial", 9, "bold"),
+                              fg="#000000", bg="#00ff88",
+                              padx=10, pady=4, cursor="hand2")
+        approve_btn.pack(side="left", padx=(0, 5))
+        approve_btn.bind("<Button-1>", lambda e, r=req: self.approve_barrier_request(r.id))
+
+        deny_btn = tk.Label(btn_row, text="✗ Deny",
+                           font=("Arial", 9, "bold"),
+                           fg="#ffffff", bg="#ff4444",
+                           padx=10, pady=4, cursor="hand2")
+        deny_btn.pack(side="left")
+        deny_btn.bind("<Button-1>", lambda e, r=req: self.deny_barrier_request(r.id))
+
+    def approve_barrier_request(self, request_id):
+        """Approve a single request."""
+        self.session_mgr.approve_request(request_id)
+        self.refresh_barrier_list()
+        self.update_barrier_indicator()
+
+    def deny_barrier_request(self, request_id):
+        """Deny a single request."""
+        self.session_mgr.deny_request(request_id)
+        self.refresh_barrier_list()
+        self.update_barrier_indicator()
+
+    def approve_all_barrier(self):
+        """Approve all pending requests."""
+        self.session_mgr.approve_all_requests()
+        self.refresh_barrier_list()
+        self.update_barrier_indicator()
+
+    def deny_all_barrier(self):
+        """Deny all pending requests."""
+        self.session_mgr.deny_all_requests()
+        self.refresh_barrier_list()
+        self.update_barrier_indicator()
+
+    def turn_off_barrier_mode(self):
+        """Turn off barrier mode globally and release any pending requests."""
+        self.session_mgr.settings["barrier_mode"] = False
+        self.session_mgr._save()
+        # Auto-approve any pending requests so they're not stuck waiting
+        self.session_mgr.approve_all_requests()
+        self.update_barrier_indicator()
+        # Close the barrier window
+        if self.barrier_window:
+            self.barrier_window.destroy()
+            self.barrier_window = None
+        messagebox.showinfo("Barrier Mode", "Barrier mode has been turned OFF.\nAny pending requests have been auto-approved.")
+
     def create_ui(self):
         # Main container
         self.main = tk.Frame(self.root, bg=COLORS["bg"])
@@ -467,6 +802,20 @@ class ModernApp:
             btn.bind("<Enter>", lambda e, b=btn: self.nav_hover(b, True))
             btn.bind("<Leave>", lambda e, b=btn: self.nav_hover(b, False))
             self.nav_buttons[tab_id] = btn
+
+        # BARRIER MODE INDICATOR - Above panic button
+        barrier_frame = tk.Frame(self.sidebar, bg=COLORS["bg_secondary"])
+        barrier_frame.pack(side="bottom", fill="x", padx=15, pady=(0, 5))
+
+        self.barrier_indicator = tk.Label(barrier_frame, text="🛡️ Barrier: 0 pending",
+                                         font=("Arial", 10),
+                                         fg=COLORS["text_muted"], bg=COLORS["card"],
+                                         pady=8, cursor="hand2")
+        self.barrier_indicator.pack(fill="x")
+        self.barrier_indicator.bind("<Button-1>", lambda e: self.show_barrier_window())
+
+        # Update indicator based on barrier mode status
+        self.update_barrier_indicator()
 
         # PANIC BUTTON - Bottom of sidebar
         panic_frame = tk.Frame(self.sidebar, bg=COLORS["bg_secondary"])
@@ -1549,6 +1898,43 @@ result = openai.image(
                 font=("Arial", 8),
                 fg=COLORS["text_muted"], bg=COLORS["bg"]).pack(anchor="w")
 
+        # Barrier Mode Section (per-session override)
+        tk.Label(frame, text="─── BARRIER MODE ───",
+                font=("Arial", 10, "bold"),
+                fg="#ff6600", bg=COLORS["bg"]).pack(anchor="w", pady=(15, 5))
+
+        tk.Label(frame, text="Override global barrier mode for this session:",
+                font=("Arial", 9),
+                fg=COLORS["text_muted"], bg=COLORS["bg"]).pack(anchor="w")
+
+        barrier_frame = tk.Frame(frame, bg=COLORS["card"], padx=10, pady=8)
+        barrier_frame.pack(fill="x", pady=5)
+
+        # Current value: None = use global, True = force on, False = force off
+        current_barrier = getattr(session, 'barrier_mode', None)
+        barrier_var = tk.StringVar(value="global" if current_barrier is None else ("on" if current_barrier else "off"))
+
+        tk.Radiobutton(barrier_frame, text="Use Global Setting",
+                      variable=barrier_var, value="global",
+                      font=("Arial", 10),
+                      fg=COLORS["text"], bg=COLORS["card"],
+                      selectcolor=COLORS["bg"],
+                      activebackground=COLORS["card"]).pack(anchor="w")
+
+        tk.Radiobutton(barrier_frame, text="Force ON (require approval for this session)",
+                      variable=barrier_var, value="on",
+                      font=("Arial", 10),
+                      fg="#00ff88", bg=COLORS["card"],
+                      selectcolor=COLORS["bg"],
+                      activebackground=COLORS["card"]).pack(anchor="w")
+
+        tk.Radiobutton(barrier_frame, text="Force OFF (no approval needed for this session)",
+                      variable=barrier_var, value="off",
+                      font=("Arial", 10),
+                      fg="#ff6666", bg=COLORS["card"],
+                      selectcolor=COLORS["bg"],
+                      activebackground=COLORS["card"]).pack(anchor="w")
+
         def save():
             allowed_raw = allowed_text.get("1.0", "end").strip()
             banned_raw = banned_text.get("1.0", "end").strip()
@@ -1579,6 +1965,15 @@ result = openai.image(
             providers_raw = providers_entry.get().strip()
             allowed_p = [p.strip().lower() for p in providers_raw.split(",") if p.strip()]
             session.allowed_providers = allowed_p
+
+            # Save barrier mode override
+            barrier_choice = barrier_var.get()
+            if barrier_choice == "global":
+                session.barrier_mode = None
+            elif barrier_choice == "on":
+                session.barrier_mode = True
+            else:
+                session.barrier_mode = False
 
             # ALWAYS save - this was the bug (was inside try block)
             self.session_mgr._save()
@@ -2722,7 +3117,7 @@ result = openai.image(
         display_name = api.get("name", key_id)
         url = api.get("url", "")
         notes = api.get("notes", "")
-        has_key = keyring.get_password(SERVICE_NAME, key_id) is not None
+        has_key = secure_has_key(key_id)
 
         row = tk.Frame(parent, bg=COLORS["card"], pady=12, padx=20)
         row.pack(fill="x", pady=4, padx=30)
@@ -2847,7 +3242,7 @@ result = openai.image(
 
     def create_key_row(self, parent, key_id, display_name):
         """Create a key management row (legacy)."""
-        has_key = keyring.get_password(SERVICE_NAME, key_id) is not None
+        has_key = secure_has_key(key_id)
 
         row = tk.Frame(parent, bg=COLORS["card"], pady=15, padx=20)
         row.pack(fill="x", pady=2)
@@ -3015,11 +3410,8 @@ result = openai.image(
         """Remove an API from the tracked list."""
         if messagebox.askyesno("Remove API",
                               f"Remove '{display_name}' from your API list?\n\nThis will also delete the stored key."):
-            # Remove from keyring
-            try:
-                keyring.delete_password(SERVICE_NAME, key_id)
-            except:
-                pass
+            # Remove from secure storage
+            secure_delete_key(key_id)
 
             # Remove from list
             keys = get_api_keys_list()
@@ -3043,7 +3435,7 @@ result = openai.image(
                 font=("Segoe UI", 14, "bold"),
                 fg=COLORS["text"], bg=COLORS["bg"]).pack(anchor="w")
 
-        tk.Label(frame, text="Key will be stored in Windows Credential Manager",
+        tk.Label(frame, text="Key will be stored in encrypted local storage",
                 font=("Segoe UI", 10),
                 fg=COLORS["text_secondary"], bg=COLORS["bg"]).pack(anchor="w", pady=(5, 15))
 
@@ -3073,7 +3465,7 @@ result = openai.image(
         def save():
             value = entry.get().strip()
             if value:
-                keyring.set_password(SERVICE_NAME, key_id, value)
+                secure_set_key(key_id, value)
                 dialog.destroy()
                 self.show_tab("keys")
 
@@ -3087,10 +3479,7 @@ result = openai.image(
 
     def remove_key(self, key_id, display_name):
         if messagebox.askyesno("Remove Key", f"Remove {display_name} API key?"):
-            try:
-                keyring.delete_password(SERVICE_NAME, key_id)
-            except:
-                pass
+            secure_delete_key(key_id)
             self.show_tab("keys")
 
     def show_settings(self):
@@ -3187,15 +3576,34 @@ result = openai.image(
                                  state="normal" if HAS_NOTIFICATIONS else "disabled")
         notif_cb.pack(anchor="w", pady=2)
 
-        tk.Label(opt_frame, text="Note: Changes require app restart",
+        # Barrier Mode toggle - read fresh from disk
+        barrier_var = tk.BooleanVar(value=self.session_mgr.is_barrier_active())
+        barrier_cb = tk.Checkbutton(opt_frame, text="🛡️ Barrier Mode (require approval for each API call)",
+                                   variable=barrier_var,
+                                   font=("Arial", 10),
+                                   fg="#ff6600", bg=COLORS["card"],
+                                   selectcolor=COLORS["bg"],
+                                   activebackground=COLORS["card"])
+        barrier_cb.pack(anchor="w", pady=2)
+
+        tk.Label(opt_frame, text="    When enabled, every API call shows a popup requiring your approval",
+                font=("Arial", 9),
+                fg=COLORS["text_muted"], bg=COLORS["card"]).pack(anchor="w")
+
+        tk.Label(opt_frame, text="Note: Barrier mode takes effect immediately. Tray/notifications require restart.",
                 font=("Arial", 9),
                 fg=COLORS["text_muted"], bg=COLORS["card"]).pack(anchor="w", pady=(5, 0))
 
         def save_optional():
             self.session_mgr.settings["enable_tray"] = tray_var.get()
             self.session_mgr.settings["enable_notifications"] = notif_var.get()
+            self.session_mgr.settings["barrier_mode"] = barrier_var.get()
             self.session_mgr._save()
-            messagebox.showinfo("Saved", "Optional features saved. Restart app to apply changes.")
+            # Barrier mode takes effect immediately, others need restart
+            if barrier_var.get():
+                messagebox.showinfo("Saved", "Barrier Mode ENABLED - every API call will require your approval.\n\nTray/notification changes require app restart.")
+            else:
+                messagebox.showinfo("Saved", "Optional features saved. Restart app to apply changes.")
 
         save_opt_btn = tk.Label(opt_frame, text="Save Options",
                                font=("Arial", 10, "bold"),

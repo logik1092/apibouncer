@@ -6,10 +6,11 @@ Track projects, manage sessions, log attempts, calculate savings.
 
 import json
 import uuid
+import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 import os
 
 
@@ -70,6 +71,9 @@ class Session:
     warning_count: int = 0
     ban_reason: Optional[str] = None
 
+    # Barrier Mode (per-session override)
+    barrier_mode: Optional[bool] = None  # None = use global, True/False = override
+
 
 @dataclass
 class Attempt:
@@ -87,6 +91,21 @@ class Attempt:
     image_path: Optional[str] = None
     request_params: Optional[Dict] = None
     response_data: Optional[Dict] = None
+
+
+@dataclass
+class BarrierRequest:
+    """A pending API request awaiting approval."""
+    id: str
+    session_id: str
+    session_name: str
+    timestamp: str
+    provider: str
+    model: str
+    estimated_cost: float
+    prompt_preview: str
+    params: Dict
+    approved: Optional[bool] = None  # None = pending, True = approved, False = denied
 
 
 class SessionManager:
@@ -107,6 +126,11 @@ class SessionManager:
             "panic_mode": False,
         }
 
+        # Barrier mode - file-based queue for cross-process IPC
+        self.barrier_file = self.data_dir / "barrier_queue.json"
+        self.barrier_lock = threading.Lock()
+        self.barrier_callback: Optional[Callable] = None  # GUI callback for new requests
+
         self._load()
 
     def is_panic_mode(self) -> bool:
@@ -117,6 +141,169 @@ class SessionManager:
         """Enable/disable panic mode."""
         self.settings["panic_mode"] = enabled
         self._save()
+
+    # =========================================================================
+    # Barrier Mode - Request Queue System
+    # =========================================================================
+
+    def is_barrier_active(self, session_id: str = None) -> bool:
+        """Check if barrier mode is active for a session or globally.
+
+        Always reads fresh from disk to ensure cross-process consistency.
+        """
+        # Check session-specific override first
+        if session_id:
+            session = self.sessions.get(session_id)
+            if session and session.barrier_mode is not None:
+                return session.barrier_mode
+
+        # Read fresh from disk to ensure cross-process consistency
+        try:
+            if self.settings_file.exists():
+                fresh_settings = json.loads(self.settings_file.read_text())
+                return fresh_settings.get("barrier_mode", False)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+        # Fall back to cached setting
+        return self.settings.get("barrier_mode", False)
+
+    def set_barrier_callback(self, callback: Callable):
+        """Set callback to notify GUI when new requests arrive."""
+        self.barrier_callback = callback
+
+    def _load_barrier_queue(self) -> List[dict]:
+        """Load barrier queue from file."""
+        if self.barrier_file.exists():
+            try:
+                return json.loads(self.barrier_file.read_text())
+            except (json.JSONDecodeError, IOError):
+                pass
+        return []
+
+    def _save_barrier_queue(self, queue: List[dict]):
+        """Save barrier queue to file."""
+        try:
+            self.barrier_file.write_text(json.dumps(queue, indent=2))
+        except IOError:
+            pass
+
+    def queue_barrier_request(self, session_id: str, provider: str, model: str,
+                              cost: float, params: dict = None) -> BarrierRequest:
+        """Add a request to the barrier queue and return the request object."""
+        session = self.sessions.get(session_id)
+        session_name = session.name if session else "Unknown"
+
+        # Extract prompt preview
+        prompt_preview = ""
+        if params:
+            prompt = params.get("prompt", "")
+            if prompt:
+                prompt_preview = prompt[:150] + ("..." if len(prompt) > 150 else "")
+
+        request = BarrierRequest(
+            id=str(uuid.uuid4())[:8],
+            session_id=session_id,
+            session_name=session_name,
+            timestamp=datetime.now().strftime("%H:%M:%S"),
+            provider=provider,
+            model=model,
+            estimated_cost=cost,
+            prompt_preview=prompt_preview,
+            params=params or {},
+        )
+
+        with self.barrier_lock:
+            queue = self._load_barrier_queue()
+            queue.append(asdict(request))
+            self._save_barrier_queue(queue)
+
+        # Notify GUI if callback is set
+        if self.barrier_callback:
+            try:
+                self.barrier_callback()
+            except Exception:
+                pass
+
+        return request
+
+    def get_pending_requests(self) -> List[BarrierRequest]:
+        """Get all pending requests from file."""
+        with self.barrier_lock:
+            queue = self._load_barrier_queue()
+            pending = []
+            for item in queue:
+                if item.get("approved") is None:
+                    pending.append(BarrierRequest(**item))
+            return pending
+
+    def approve_request(self, request_id: str):
+        """Approve a single request."""
+        with self.barrier_lock:
+            queue = self._load_barrier_queue()
+            for item in queue:
+                if item["id"] == request_id and item.get("approved") is None:
+                    item["approved"] = True
+                    break
+            self._save_barrier_queue(queue)
+
+    def deny_request(self, request_id: str):
+        """Deny a single request."""
+        with self.barrier_lock:
+            queue = self._load_barrier_queue()
+            for item in queue:
+                if item["id"] == request_id and item.get("approved") is None:
+                    item["approved"] = False
+                    break
+            self._save_barrier_queue(queue)
+
+    def approve_all_requests(self):
+        """Approve all pending requests."""
+        with self.barrier_lock:
+            queue = self._load_barrier_queue()
+            for item in queue:
+                if item.get("approved") is None:
+                    item["approved"] = True
+            self._save_barrier_queue(queue)
+
+    def deny_all_requests(self):
+        """Deny all pending requests."""
+        with self.barrier_lock:
+            queue = self._load_barrier_queue()
+            for item in queue:
+                if item.get("approved") is None:
+                    item["approved"] = False
+            self._save_barrier_queue(queue)
+
+    def clear_completed_requests(self):
+        """Remove completed (approved/denied) requests from queue."""
+        with self.barrier_lock:
+            queue = self._load_barrier_queue()
+            queue = [item for item in queue if item.get("approved") is None]
+            self._save_barrier_queue(queue)
+
+    def get_request_status(self, request_id: str) -> Optional[bool]:
+        """Check if a request has been approved/denied. Returns None if still pending."""
+        with self.barrier_lock:
+            queue = self._load_barrier_queue()
+            for item in queue:
+                if item["id"] == request_id:
+                    return item.get("approved")
+        return None
+
+    def wait_for_approval(self, request_id: str, timeout: float = None, poll_interval: float = 0.3) -> bool:
+        """Wait for a request to be approved or denied. Returns True if approved."""
+        import time
+        start = time.time()
+        while True:
+            status = self.get_request_status(request_id)
+            if status is not None:
+                return status == True
+
+            if timeout and (time.time() - start) >= timeout:
+                return False  # Timeout - treat as denied
+
+            time.sleep(poll_interval)
 
     def _load(self):
         """Load data from files."""
@@ -136,6 +323,7 @@ class SessionManager:
                         'allowed_qualities': [],
                         'banned_qualities': [],
                         'max_duration': 0,
+                        'barrier_mode': None,
                     }
                     for key, default in defaults.items():
                         if key not in sdata:

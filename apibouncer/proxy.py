@@ -36,6 +36,13 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 try:
+    from .keystore import get_keystore
+    HAS_KEYSTORE = True
+except ImportError:
+    HAS_KEYSTORE = False
+
+# Fallback to keyring if keystore not available
+try:
     import keyring
 except ImportError:
     keyring = None
@@ -61,12 +68,24 @@ def _generate_image_path(session_id: str, model: str) -> Path:
 
 
 def _get_key(provider: str) -> str:
-    """Get API key from secure storage. Never exposed to AI."""
-    if not keyring:
-        raise RuntimeError("keyring not installed")
-    key = keyring.get_password(SERVICE_NAME, provider)
+    """Get API key from secure encrypted storage. Never exposed to AI."""
+    key = None
+
+    # Try encrypted keystore first (secure)
+    if HAS_KEYSTORE:
+        try:
+            store = get_keystore()
+            key = store.get_key(provider)
+        except Exception:
+            pass
+
+    # Fallback to keyring (less secure, for migration)
+    if not key and keyring:
+        key = keyring.get_password(SERVICE_NAME, provider)
+
     if not key:
         raise RuntimeError(f"No API key configured for '{provider}'")
+
     return key
 
 
@@ -113,6 +132,29 @@ def _check_rate_limit(mgr, session_id: str):
         if reset_seconds > 0:
             raise PermissionError(f"Rate limited: {msg}. Try again in {reset_seconds}s")
         raise PermissionError(f"Rate limited: {msg}")
+
+
+def _check_barrier(mgr, session_id: str, provider: str, model: str, cost: float, params: dict = None):
+    """
+    Barrier mode - requires manual approval for each API call.
+    Queues the request and waits for approval via the GUI (file-based IPC).
+    """
+    if not mgr.is_barrier_active(session_id):
+        return True  # Barrier mode disabled, allow
+
+    # Queue the request and wait for approval
+    request = mgr.queue_barrier_request(session_id, provider, model, cost, params)
+
+    # Wait indefinitely for user decision (polls file every 300ms)
+    approved = mgr.wait_for_approval(request.id)
+
+    # Clean up completed requests periodically
+    mgr.clear_completed_requests()
+
+    if not approved:
+        raise PermissionError("Request denied by user (Barrier Mode)")
+
+    return True
 
 
 def _get_videos_dir() -> Path:
@@ -572,6 +614,13 @@ class OpenAI:
                 f"Request cost: ${cost:.2f}"
             )
 
+        # Barrier mode - require manual approval
+        try:
+            _check_barrier(mgr, session_id, "openai", model, cost, req_params)
+        except PermissionError as e:
+            _record(mgr, session_id, "openai", model, cost, False, str(e), request_params=req_params)
+            raise
+
         api_key = _get_key("openai")
 
         try:
@@ -779,6 +828,13 @@ class Fal:
                 f"Request cost: ${cost:.2f}"
             )
 
+        # Barrier mode - require manual approval
+        try:
+            _check_barrier(mgr, session_id, "fal", model, cost, req_params)
+        except PermissionError as e:
+            _record(mgr, session_id, "fal", model, cost, False, str(e), request_params=req_params)
+            raise
+
         api_key = _get_key("fal")
 
         if reference_images:
@@ -900,9 +956,10 @@ class Fal:
 # =============================================================================
 
 class MiniMax:
-    """MiniMax API proxy for video generation."""
+    """MiniMax API proxy for video and TTS generation."""
 
-    BASE_URL = "https://api.minimax.chat/v1"
+    BASE_URL = "https://api.minimax.chat/v1"  # Video API
+    TTS_BASE_URL = "https://api.minimax.io/v1"  # TTS API (different domain!)
 
     COSTS = {
         "video-01": 0.05,
@@ -975,6 +1032,13 @@ class MiniMax:
                 f"Spent: ${session.total_cost:.2f}, Remaining: ${remaining:.2f}, "
                 f"Request cost: ${cost:.2f}"
             )
+
+        # 7. Barrier mode - require manual approval
+        try:
+            _check_barrier(mgr, session_id, "minimax", model, cost, req_params)
+        except PermissionError as e:
+            _record(mgr, session_id, "minimax", model, cost, False, str(e), request_params=req_params)
+            raise
 
         api_key = _get_key("minimax")
 
@@ -1175,6 +1239,13 @@ class MiniMax:
                 f"Request cost: ${cost:.4f} ({char_count} chars)"
             )
 
+        # 6. Barrier mode - require manual approval
+        try:
+            _check_barrier(mgr, session_id, "minimax", model, cost, req_params)
+        except PermissionError as e:
+            _record(mgr, session_id, "minimax", model, cost, False, str(e), request_params=req_params)
+            raise
+
         api_key = _get_key("minimax")
 
         headers = {
@@ -1201,7 +1272,7 @@ class MiniMax:
 
         try:
             response = requests.post(
-                f"{MiniMax.BASE_URL}/t2a_v2",
+                f"{MiniMax.TTS_BASE_URL}/t2a_v2",
                 headers=headers,
                 json=payload,
                 timeout=120
@@ -1219,8 +1290,9 @@ class MiniMax:
                 _record(mgr, session_id, "minimax", model, 0, False, f"API rejected: {error_msg}")
                 raise RuntimeError(f"MiniMax TTS rejected: {error_msg}")
 
-            # Get audio data (base64 encoded)
+            # Get audio data - can be base64 or URL depending on API version
             audio_data = data.get("data", {}).get("audio")
+
             if not audio_data:
                 # Try alternate response format
                 audio_url = data.get("audio_file")
@@ -1230,9 +1302,17 @@ class MiniMax:
                 else:
                     _record(mgr, session_id, "minimax", model, 0, False, "No audio in response")
                     raise RuntimeError("MiniMax TTS did not return audio data")
+            elif audio_data.startswith("http"):
+                # It's a URL - download it
+                audio_response = requests.get(audio_data, timeout=60)
+                audio_bytes = audio_response.content
             else:
-                # Decode base64 audio
-                audio_bytes = base64.b64decode(audio_data)
+                # MiniMax returns hex-encoded audio, not base64
+                try:
+                    audio_bytes = bytes.fromhex(audio_data)
+                except ValueError:
+                    # Fallback to base64 if hex fails
+                    audio_bytes = base64.b64decode(audio_data)
 
             # Save audio
             if save_to:
