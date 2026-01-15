@@ -3,6 +3,28 @@ APIBouncer Provider Proxy
 
 AI agents call these functions. They NEVER see API keys.
 Keys are injected internally, requests are validated, costs are tracked.
+
+ADDING NEW PROVIDERS:
+---------------------
+1. Create a class that inherits from BaseProvider
+2. Set PROVIDER_NAME and DEFAULT_COSTS
+3. Implement your API methods using self.validate() and self.record()
+
+Example:
+    class MyProvider(BaseProvider):
+        PROVIDER_NAME = "myprovider"
+        DEFAULT_COSTS = {"model-1": 0.01, "model-2": 0.05}
+
+        def generate(self, session_id, prompt, model="model-1"):
+            cost = self.get_cost(model)
+            self.validate(session_id, model, cost)
+
+            # Make your API call here
+            api_key = self.get_key()
+            response = requests.post(...)
+
+            self.record(session_id, model, cost, True)
+            return response
 """
 
 import requests
@@ -253,6 +275,134 @@ def _check_provider(mgr, session_id: str, provider: str):
 
     if allowed_providers and provider not in allowed_providers:
         raise PermissionError(f"Provider '{provider}' not allowed. Allowed: {', '.join(allowed_providers)}")
+
+
+# =============================================================================
+# Base Provider Class - Inherit from this to add new providers easily
+# =============================================================================
+
+class BaseProvider:
+    """
+    Base class for API providers. Inherit from this to add new providers.
+
+    Example:
+        class Replicate(BaseProvider):
+            PROVIDER_NAME = "replicate"
+            DEFAULT_COSTS = {"sdxl": 0.01, "flux": 0.03}
+
+            def run(self, session_id, model, prompt, **kwargs):
+                cost = self.get_cost(model)
+                params = {"prompt": prompt, "model": model, **kwargs}
+
+                self.validate(session_id, model, cost, params)
+
+                api_key = self.get_key()
+                # ... make API call ...
+
+                self.record_success(session_id, model, cost, params)
+                return result
+    """
+
+    PROVIDER_NAME = "base"  # Override this
+    DEFAULT_COSTS = {}  # Override this: {"model": cost} or {"model": {"low": 0.01, "high": 0.05}}
+
+    def get_key(self) -> str:
+        """Get API key for this provider."""
+        return _get_key(self.PROVIDER_NAME)
+
+    def get_cost(self, model: str, quality: str = None) -> float:
+        """Get cost for a model/quality combination."""
+        return _get_price(self.PROVIDER_NAME, model, quality)
+
+    def validate(self, session_id: str, model: str, cost: float, params: dict = None):
+        """
+        Validate the request. Raises PermissionError if blocked.
+        Call this BEFORE making API requests.
+        """
+        self._mgr = _check_session(session_id)
+        self._session_id = session_id
+        self._params = params or {}
+
+        try:
+            _check_provider(self._mgr, session_id, self.PROVIDER_NAME)
+        except PermissionError as e:
+            self.record_blocked(session_id, model, cost, str(e))
+            raise
+
+        try:
+            _check_model(self._mgr, session_id, model)
+        except PermissionError as e:
+            self.record_blocked(session_id, model, cost, f"Model blocked: {model}")
+            raise
+
+        try:
+            _check_rate_limit(self._mgr, session_id)
+        except PermissionError as e:
+            self.record_blocked(session_id, model, cost, str(e))
+            raise
+
+        # Check budget
+        session = self._mgr.get_session(session_id)
+        if session.budget_limit > 0 and (session.total_cost + cost) > session.budget_limit:
+            remaining = max(0, session.budget_limit - session.total_cost)
+            self.record_blocked(session_id, model, cost, "Would exceed budget")
+            raise PermissionError(
+                f"Budget exceeded. Limit: ${session.budget_limit:.2f}, "
+                f"Spent: ${session.total_cost:.2f}, Remaining: ${remaining:.2f}, "
+                f"Request cost: ${cost:.2f}"
+            )
+
+    def validate_quality(self, session_id: str, quality: str, model: str, cost: float):
+        """Validate quality setting. Call after validate() if your provider uses quality."""
+        try:
+            _check_quality(self._mgr, session_id, quality)
+        except PermissionError as e:
+            self.record_blocked(session_id, model, cost, f"Quality '{quality}' blocked")
+            raise
+
+    def validate_duration(self, session_id: str, duration: int, model: str, cost: float):
+        """Validate duration. Call after validate() if your provider uses duration (video)."""
+        try:
+            _check_duration(self._mgr, session_id, duration)
+        except PermissionError as e:
+            self.record_blocked(session_id, model, cost, str(e))
+            raise
+
+    def record_success(self, session_id: str, model: str, cost: float,
+                       params: dict = None, save_path: str = None, response_data: dict = None):
+        """Record a successful API call."""
+        _record(self._mgr, session_id, self.PROVIDER_NAME, model, cost, True,
+                image_path=save_path, request_params=params or self._params, response_data=response_data)
+
+    def record_blocked(self, session_id: str, model: str, cost: float, reason: str):
+        """Record a blocked request."""
+        from .sessions import get_session_manager
+        mgr = getattr(self, '_mgr', None) or get_session_manager()
+        _record(mgr, session_id, self.PROVIDER_NAME, model, cost, False, reason,
+                request_params=getattr(self, '_params', {}))
+
+    def record_error(self, session_id: str, model: str, reason: str):
+        """Record an API error (no cost charged)."""
+        _record(self._mgr, session_id, self.PROVIDER_NAME, model, 0, False, reason,
+                request_params=getattr(self, '_params', {}))
+
+    def save_image(self, image_bytes: bytes, session_id: str, model: str) -> Path:
+        """Save image bytes to the images directory. Returns the path."""
+        path = _generate_image_path(session_id, model)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(image_bytes)
+        return path
+
+    def save_video(self, video_bytes: bytes, session_id: str, model: str) -> Path:
+        """Save video bytes to the videos directory. Returns the path."""
+        path = _generate_video_path(session_id, model)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(video_bytes)
+        return path
+
+
+# Provider registry - add new providers here for auto-discovery
+PROVIDERS = {}
 
 
 # =============================================================================

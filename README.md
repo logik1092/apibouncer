@@ -45,9 +45,12 @@ You control:
 
 ## Supported Providers
 
+**Built-in:**
 - OpenAI (GPT-Image-1.5, DALL-E, GPT-4o)
 - fal.ai (Flux models, cheaper GPT-Image-1.5)
 - MiniMax (Video generation)
+
+**Add your own:** See `examples/add_provider.py` - just inherit from `BaseProvider` and write your API call.
 
 ---
 
